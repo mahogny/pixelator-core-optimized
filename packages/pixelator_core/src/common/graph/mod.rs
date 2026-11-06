@@ -1,5 +1,9 @@
 use rustc_hash::FxHashSet as HashSet;
-use sprs::CsMat;
+use sprs::CsMatI;
+
+/// Adjacency storage: u32 column indices, usize row offsets. [pixelator-rs patch: was CsMat<T>
+/// (usize indices); halves index memory, results unchanged]
+pub type AdjMat<T> = CsMatI<T, u32, usize>;
 use std::collections::VecDeque;
 
 use crate::common::types::{Edge, EdgeWeight, NodeIdx};
@@ -29,7 +33,7 @@ pub use statistics::GraphProperties;
 /// exist, while `total_edge_weight` preserves how strongly communities are connected.
 #[derive(Clone)]
 pub struct Graph<T> {
-    adjacency_matrix: CsMat<T>,
+    adjacency_matrix: AdjMat<T>,
     num_nodes: usize,
     edge_entry_count: usize,
     total_edge_weight: usize,
@@ -58,7 +62,7 @@ impl<T: EdgeWeight> Graph<T> {
         Self::from_adjacency_matrix(adjacency_matrix)
     }
 
-    pub fn from_adjacency_matrix(adjacency_matrix: CsMat<T>) -> Self {
+    pub fn from_adjacency_matrix(adjacency_matrix: AdjMat<T>) -> Self {
         let num_nodes = adjacency_matrix.rows();
         let edge_entry_count = adjacency_matrix
             .view()
@@ -84,7 +88,7 @@ impl<T: EdgeWeight> Graph<T> {
         }
     }
 
-    pub fn get_adjacency_matrix(&self) -> &CsMat<T> {
+    pub fn get_adjacency_matrix(&self) -> &AdjMat<T> {
         &self.adjacency_matrix
     }
 
@@ -155,7 +159,7 @@ impl<T: EdgeWeight> Graph<T> {
 
         indices[start..end]
             .iter()
-            .copied()
+            .map(|&x| x as usize)
             .filter(move |&neighbor_id| neighbor_id != node)
     }
 
@@ -189,7 +193,7 @@ impl<T: EdgeWeight> Graph<T> {
 
         indices[start..end]
             .iter()
-            .copied()
+            .map(|&x| x as usize)
             .zip(data[start..end].iter().copied())
             .map(move |(neighbor_id, weight)| Edge::new(node, neighbor_id, Some(weight)))
     }
@@ -201,7 +205,7 @@ impl<T: EdgeWeight> Graph<T> {
         self.adjacency_matrix
             .view()
             .iter_rbr()
-            .map(|(&weight, (node_1, node_2))| Edge::new(node_1, node_2, Some(weight)))
+            .map(|(&weight, (node_1, node_2))| Edge::new(node_1 as usize, node_2 as usize, Some(weight)))
     }
 
     /// Get all edges where at least one of the nodes is in the selection
@@ -269,7 +273,7 @@ impl<T: EdgeWeight> Graph<T> {
 /// Input edges are stored once as `(min, max, weight)`, merged by summing duplicate
 /// pairs (sprs COO semantics), then expanded into both CSR directions. Self-loops
 /// are stored once. The undirected buffer is dropped before this function returns.
-fn csr_from_undirected_edges<T, I>(edges: I, num_nodes: NodeIdx) -> CsMat<T>
+fn csr_from_undirected_edges<T, I>(edges: I, num_nodes: NodeIdx) -> AdjMat<T>
 where
     T: EdgeWeight,
     I: Iterator<Item = Edge<T>>,
@@ -292,7 +296,7 @@ where
 fn csr_from_undirected_triplets<T>(
     mut triplets: Vec<(NodeIdx, NodeIdx, T)>,
     num_nodes: NodeIdx,
-) -> CsMat<T>
+) -> AdjMat<T>
 where
     T: EdgeWeight,
 {
@@ -331,23 +335,24 @@ where
     let mut indptr = Vec::with_capacity(num_nodes + 1);
     indptr.extend_from_slice(&next);
     indptr.push(nnz);
-    let mut indices = vec![0usize; nnz];
+    assert!(num_nodes <= u32::MAX as usize, "node count exceeds u32");
+    let mut indices = vec![0u32; nnz];
     let mut data = vec![T::zero(); nnz];
 
     for (u, v, weight) in triplets {
         let i = next[u];
-        indices[i] = v;
+        indices[i] = v as u32;
         data[i] = weight;
         next[u] += 1;
         if u != v {
             let j = next[v];
-            indices[j] = u;
+            indices[j] = u as u32;
             data[j] = weight;
             next[v] += 1;
         }
     }
 
-    CsMat::new((num_nodes, num_nodes), indptr, indices, data)
+    CsMatI::new((num_nodes, num_nodes), indptr, indices, data)
 }
 
 impl From<Graph<u8>> for Graph<usize> {
@@ -356,7 +361,7 @@ impl From<Graph<u8>> for Graph<usize> {
         let indptr = graph.adjacency_matrix.indptr();
         let indices = graph.adjacency_matrix.indices();
         let data = graph.adjacency_matrix.data();
-        let adjacency_matrix = CsMat::new(
+        let adjacency_matrix = AdjMat::<usize>::new(
             shape,
             indptr.as_slice().unwrap().into(),
             indices.into(),

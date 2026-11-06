@@ -221,6 +221,83 @@ impl<Q: QualityMetrics> WeightedPartitionedGraph<Q> {
         }
     }
 
+    /// [pixelator-rs patch] Equivalent to `new(Graph::<usize>::from(graph), partitions, q, None,
+    /// seed)` followed by `aggregate(AggregateOptions::All)`, but built straight from `graph`
+    /// without the full-size `Graph<usize>` copy (32 B/edge). Returns `Err(graph)` when the quality
+    /// metric cannot give node sizes from degrees (callers then use the old path).
+    pub fn new_aggregated<T: crate::common::types::EdgeWeight>(
+        graph: Graph<T>,
+        partitions: LeidenNodePartitioning,
+        quality_metrics: Q,
+        seed: Option<u64>,
+    ) -> Result<Self, (Graph<T>, LeidenNodePartitioning, Q)> {
+        let n = graph.get_num_nodes();
+        let node_weights = match quality_metrics.node_sizes_from_degrees(graph.get_degrees(), n) {
+            Some(w) => w,
+            None => return Err((graph, partitions, quality_metrics)),
+        };
+        // --- as in `new`
+        let partitions = if partitions.is_normalized() {
+            partitions
+        } else {
+            let dense_ids = partitions.get_dense_mapping();
+            LeidenNodePartitioning::initialize_from_partitions(
+                partitions.get_node_to_partition_map().iter().map(|id| dense_ids[id]).collect(),
+            )
+        };
+        let partition_weights = PartitionWeights::from_node_partitions(
+            partitions.get_node_to_partition_map(),
+            &node_weights,
+            partitions.get_new_partition_id(),
+        );
+        // --- as in `aggregate(AggregateOptions::All)`
+        let mut normalized_partition_map = vec![0; partitions.get_new_partition_id()];
+        for (new_pid, (&old_pid, _)) in partitions
+            .get_partition_to_node_map_ref()
+            .iter()
+            .filter(|(_, nodes)| !nodes.is_empty())
+            .enumerate()
+        {
+            normalized_partition_map[old_pid] = new_pid;
+        }
+        let sub_partition_index = partitions
+            .get_node_to_partition_map()
+            .iter()
+            .map(|&p_id| normalized_partition_map[p_id])
+            .collect::<Vec<NodeIdx>>();
+        drop(normalized_partition_map);
+        let n_partitions = partitions.num_partitions();
+        // Pre-merge parallel edges between the same pair of partitions (integer sums, so the
+        // resulting CSR is identical to collecting all edges first) to avoid a 24 B/edge buffer.
+        let mut merged: HashMap<(NodeIdx, NodeIdx), usize> = HashMap::default();
+        for Edge { src, dest, weight } in graph.get_edges_iter().filter(|Edge { src, dest, .. }| src <= dest) {
+            let w: usize = weight.into();
+            *merged.entry((sub_partition_index[src], sub_partition_index[dest])).or_insert(0) += w;
+        }
+        let aggregated_graph = Graph::<usize>::from_edges(
+            merged.into_iter().map(|((src, dest), weight)| Edge { src, dest, weight }),
+            n_partitions,
+        );
+        drop(graph);
+        let mut new_partitions = vec![0; n_partitions];
+        let mut new_node_weights = vec![0; n_partitions];
+        for (&new_pid, &pid) in sub_partition_index.iter().zip(partitions.get_node_to_partition_map().iter()) {
+            new_partitions[new_pid] = pid;
+            new_node_weights[new_pid] = partition_weights.get(pid);
+        }
+        let new_partitions = LeidenNodePartitioning::initialize_from_partitions(new_partitions);
+        drop(partitions);
+        Ok(WeightedPartitionedGraph {
+            graph: aggregated_graph,
+            partitions: new_partitions,
+            node_weights: new_node_weights,
+            partition_weights,
+            quality_metrics,
+            ancestor_map: sub_partition_index,
+            rng: StdRng::seed_from_u64(seed.unwrap_or(0)),
+        })
+    }
+
     pub fn get_graph(&self) -> &Graph<usize> {
         &self.graph
     }

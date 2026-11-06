@@ -41,7 +41,7 @@ impl AssignmentStrategy<FastNodePartitioning> for DefaultAssignmentStrategy {
         partitions.extend(
             neighbors
                 .iter()
-                .map(|x| node_partition.get_partition_for_node(x)),
+                .map(|&x| node_partition.get_partition_for_node(&(x as usize))),
         );
 
         // Finding the most common partition among neighbors by sorting and picking the mode
@@ -54,11 +54,11 @@ impl AssignmentStrategy<FastNodePartitioning> for DefaultAssignmentStrategy {
             node_partition.update_partition(current_node, most_common_neighbors_partition);
             for neighbor_to_update in neighbors
                 .iter()
+                .map(|&x| x as usize)
                 .filter(|neighbor| {
                     node_partition.get_partition_for_node(neighbor)
                         != most_common_neighbors_partition
                 })
-                .copied()
             {
                 node_queue.push_back(neighbor_to_update);
             }

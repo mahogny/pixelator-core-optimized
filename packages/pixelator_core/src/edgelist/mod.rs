@@ -90,14 +90,52 @@ pub fn edgelist<P: AsRef<Path>>(
     reads_processed: Arc<AtomicU64>,
 ) -> Result<EdgelistStats, Box<dyn std::error::Error>> {
     let output_dir = output_dir.as_ref();
+    let path = output_dir.join(format!("{sample_name}.parquet"));
+    edgelist_impl(
+        input, sample_name, assay, panel, output_dir, n_threads, filters, save_dropped_reads, reads_processed,
+        Box::new(move |rx: Receiver<RecordBatch>| {
+            write_record_batches_to_path(path, RowBuffer::schema(), rx.into_iter(), None).map_err(|e| e.to_string())
+        }),
+    )
+}
 
+/// Consumer of the kept-row batches (runs on its own thread). [pixelator-rs patch]
+pub type BatchSink = Box<dyn FnOnce(Receiver<RecordBatch>) -> Result<(), String> + Send>;
+
+/// Like [`edgelist`], but the kept rows go to `sink` instead of a Parquet file (dropped reads,
+/// if requested, are still written to `{output_dir}/{sample_name}.dropped_reads.parquet`).
+/// [pixelator-rs patch]
+#[allow(clippy::too_many_arguments)]
+pub fn edgelist_to_sink<P: AsRef<Path>>(
+    input: FastqInput,
+    sample_name: String,
+    assay: Assay,
+    panel: Panel,
+    output_dir: P,
+    n_threads: usize,
+    filters: FilterConfig,
+    save_dropped_reads: bool,
+    reads_processed: Arc<AtomicU64>,
+    sink: BatchSink,
+) -> Result<EdgelistStats, Box<dyn std::error::Error>> {
+    edgelist_impl(input, sample_name, assay, panel, output_dir.as_ref(), n_threads, filters, save_dropped_reads, reads_processed, sink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edgelist_impl(
+    input: FastqInput,
+    sample_name: String,
+    assay: Assay,
+    panel: Panel,
+    output_dir: &Path,
+    n_threads: usize,
+    filters: FilterConfig,
+    save_dropped_reads: bool,
+    reads_processed: Arc<AtomicU64>,
+    sink: BatchSink,
+) -> Result<EdgelistStats, Box<dyn std::error::Error>> {
     let (tx, rx) = sync_channel(CHANNEL_SIZE_FACTOR * n_threads);
-    let handle = spawn_parquet_writer(
-        output_dir.join(format!("{sample_name}.parquet")),
-        RowBuffer::schema(),
-        rx,
-        None,
-    );
+    let handle = thread::spawn(move || sink(rx));
 
     let (dropped_tx, dropped_handle) = if save_dropped_reads {
         let (tx, rx) = sync_channel(DROPPED_CHANNEL_SIZE_FACTOR * n_threads);

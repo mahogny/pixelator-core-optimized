@@ -7,6 +7,24 @@ use rand::prelude::*;
 
 use crate::common::types::NodeIdx;
 
+std::thread_local! {
+    static FLP_RNG: std::cell::RefCell<Option<StdRng>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Seed (Some) or unseed (None, the default: OS-seeded `rand::rng()`) the RNG used by fast label
+/// propagation on this thread (node shuffle and mode tie-breaking). [pixelator-rs patch]
+pub fn seed_flp_rng(seed: Option<u64>) {
+    FLP_RNG.with(|r| *r.borrow_mut() = seed.map(StdRng::seed_from_u64));
+}
+
+/// Run `f` with the FLP RNG: the seeded one if set, else `rand::rng()`.
+pub fn with_flp_rng<T>(f: impl FnOnce(&mut dyn RngCore) -> T) -> T {
+    FLP_RNG.with(|r| match r.borrow_mut().as_mut() {
+        Some(rng) => f(rng),
+        None => f(&mut rand::rng()),
+    })
+}
+
 /// Returns the mode (most common value) of a mutable slice of usize, breaking ties randomly.
 ///
 /// The function sorts the input slice in-place, then finds the value that appears most frequently.
@@ -20,7 +38,10 @@ pub fn mode_via_sort(numbers: &mut [usize]) -> usize {
 
     numbers.sort_unstable();
 
-    let mut rng = rand::rng();
+    with_flp_rng(|rng| mode_with_rng(numbers, rng))
+}
+
+fn mode_with_rng(numbers: &[usize], rng: &mut dyn RngCore) -> usize {
     let ((_, best_n), _) = numbers.iter().dedup_with_count().fold(
         ((0, 0), 0),
         |((best_count, best_n), ties), (c, &n)| match c.cmp(&best_count) {

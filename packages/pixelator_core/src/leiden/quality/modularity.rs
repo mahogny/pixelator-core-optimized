@@ -22,6 +22,10 @@ impl QualityMetrics for Modularity {
     fn node_size(&self, graph: &Graph<usize>, node_id: NodeIdx) -> usize {
         graph.get_degrees()[node_id]
     }
+
+    fn node_sizes_from_degrees(&self, degrees: &[usize], _num_nodes: usize) -> Option<Vec<usize>> {
+        Some(degrees.to_vec())
+    }
 }
 
 #[cfg(test)]

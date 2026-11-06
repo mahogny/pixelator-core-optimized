@@ -35,7 +35,7 @@ where
     P: NodePartitioning,
 {
     let mut nodes: Vec<NodeIdx> = (0..graph.get_num_nodes()).collect();
-    nodes.shuffle(&mut rand::rng());
+    crate::common::utils::with_flp_rng(|rng| nodes.shuffle(rng));
     let mut node_queue = NodeQueue::from(nodes);
 
     info!("Starting label propagation...");

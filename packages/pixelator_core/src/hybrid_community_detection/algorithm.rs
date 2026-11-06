@@ -43,6 +43,16 @@ use log::debug;
 /// * Statistics after Leiden when `multiplet_recovery` is true, or the same aggregated statistics
 ///   when Leiden was skipped.
 #[allow(clippy::too_many_arguments)]
+fn memlog(tag: &str) {
+    if std::env::var_os("PXR_MEMLOG").is_none() {
+        return;
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        let get = |k: &str| s.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0) / 1e6).unwrap_or(0.0);
+        eprintln!("[mem] {tag:30} rss {:6.2} GB  peak {:6.2} GB", get("VmRSS:"), get("VmHWM:"));
+    }
+}
+
 pub fn hybrid_community_detection(
     graph: Graph<u8>,
     quality_function: impl QualityMetrics,
@@ -57,7 +67,10 @@ pub fn hybrid_community_detection(
     PartitionedGraphStatistics,
     PartitionedGraphStatistics,
 ) {
+    // [pixelator-rs patch] make FLP reproducible when a seed is given
+    crate::common::utils::seed_flp_rng(seed);
     let graph_properties = GraphProperties::new(&graph);
+    memlog("core: properties");
     debug!("Graph properties pre-aggregation: {:?}", graph_properties);
 
     let node_partition =
@@ -76,17 +89,32 @@ pub fn hybrid_community_detection(
         node_partition.num_partitions(),
     );
 
-    let graph = Graph::<usize>::from(graph);
+    memlog("core: FLP done");
     let partition = NodePartitioning::into_node_partitioning(node_partition);
+    memlog("core: into leiden partitioning");
 
-    let mut wp_graph =
-        WeightedPartitionedGraph::new(graph, partition, quality_function, None, seed);
-    wp_graph.aggregate(if refine_partitions {
-        AggregateOptions::OnlyWellConnected(randomness)
+    // [pixelator-rs patch] aggregate directly from Graph<u8> (no full Graph<usize> copy)
+    let direct = if refine_partitions {
+        Err((graph, partition, quality_function))
     } else {
-        AggregateOptions::All
-    });
+        WeightedPartitionedGraph::new_aggregated(graph, partition, quality_function, seed)
+    };
+    let mut wp_graph = match direct {
+        Ok(wp) => wp,
+        Err((graph, partition, quality_function)) => {
+            let graph = Graph::<usize>::from(graph);
+            let mut wp_graph =
+                WeightedPartitionedGraph::new(graph, partition, quality_function, None, seed);
+            wp_graph.aggregate(if refine_partitions {
+                AggregateOptions::OnlyWellConnected(randomness)
+            } else {
+                AggregateOptions::All
+            });
+            wp_graph
+        }
+    };
 
+    memlog("core: aggregated");
     let post_flp_statistics = wp_graph.get_statistics();
 
     if multiplet_recovery {
