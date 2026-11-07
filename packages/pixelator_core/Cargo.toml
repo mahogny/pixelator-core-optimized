@@ -23,7 +23,6 @@ smallvec = "1.15.2"
 itertools = "0.14.0"
 parquet = "58.4.0"
 arrow = "58.4.0"
-mimalloc = "0.1.52"
 paraseq = "0.4.14"
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = { version = "0.0.27", default-features = false, features = ["deserialize"] }
@@ -38,6 +37,7 @@ test-fixtures = []
 [dev-dependencies]
 divan = "0.1.21"
 tempfile = "3.27.0"
+mimalloc = "0.1.52"  # benches only (moved from [dependencies]; not used by the library)
 # Benches are not `cfg(test)`, so they reach `test_fixtures` through this feature.
 pixelator-core = { path = ".", features = ["test-fixtures"] }
 

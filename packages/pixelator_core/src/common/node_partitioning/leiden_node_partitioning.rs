@@ -30,6 +30,24 @@ impl LeidenNodePartitioning {
         }
     }
 
+    /// [pixelator-rs patch] Partitioning without the partition -> nodes index (built lazily by
+    /// `rebuild_partition_to_node_map_if_stale` when needed). For results that are only read via
+    /// `get_node_to_partition_map`, this avoids a hash set entry per node.
+    pub fn new_without_index(node_partition_map: Vec<PartitionId>) -> Self {
+        let new_partition_id = node_partition_map.iter().max().map_or(0, |m| m + 1);
+        LeidenNodePartitioning {
+            node_partition_map,
+            partition_to_node_map: HashMap::default(),
+            partition_to_node_map_stale: true,
+            new_partition_id,
+        }
+    }
+
+    /// [pixelator-rs patch] Whether the partition -> nodes index is built and current.
+    pub fn has_partition_index(&self) -> bool {
+        !self.partition_to_node_map_stale
+    }
+
     /// Return true of the partition only contains one node
     pub fn is_singlet_partition(&self, partition: &PartitionId) -> bool {
         self.panic_if_partition_to_node_map_stale();

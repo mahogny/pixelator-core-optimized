@@ -225,7 +225,7 @@ impl<Q: QualityMetrics> WeightedPartitionedGraph<Q> {
     /// seed)` followed by `aggregate(AggregateOptions::All)`, but built straight from `graph`
     /// without the full-size `Graph<usize>` copy (32 B/edge). Returns `Err(graph)` when the quality
     /// metric cannot give node sizes from degrees (callers then use the old path).
-    pub fn new_aggregated<T: crate::common::types::EdgeWeight>(
+    pub fn new_aggregated<T: crate::common::types::EdgeWeight + Sync + Send>(
         graph: Graph<T>,
         partitions: LeidenNodePartitioning,
         quality_metrics: Q,
@@ -236,6 +236,64 @@ impl<Q: QualityMetrics> WeightedPartitionedGraph<Q> {
             Some(w) => w,
             None => return Err((graph, partitions, quality_metrics)),
         };
+        // [pixelator-rs patch] without a partition index: dense ids by rank of the used ids
+        // (no per-node hash sets; partition numbering differs from the index-order path)
+        if !partitions.has_partition_index() {
+            let map = partitions.get_node_to_partition_map();
+            let mut rank = vec![usize::MAX; partitions.get_new_partition_id()];
+            for &p in map {
+                rank[p] = 0;
+            }
+            let mut k = 0;
+            for r in rank.iter_mut() {
+                if *r == 0 {
+                    *r = k;
+                    k += 1;
+                }
+            }
+            let dense: Vec<PartitionId> = map.iter().map(|&p| rank[p]).collect();
+            drop(rank);
+            let partition_weights = PartitionWeights::from_node_partitions(&dense, &node_weights, k);
+            // community pairs of all edges (12 B each, parallel over CSR rows), sorted and merged;
+            // integer weight sums, so the aggregated graph equals a hash-map aggregation
+            use rayon::prelude::*;
+            assert!(k < u32::MAX as usize);
+            let adj = graph.get_adjacency_matrix();
+            let mut pairs: Vec<(u32, u32, u32)> = (0..n)
+                .into_par_iter()
+                .flat_map_iter(|u| {
+                    let (idx, data) = adj.outer_view(u).map(|r| r.into_raw_storage()).unwrap_or((&[], &[]));
+                    let du = dense[u] as u32;
+                    let dense = &dense;
+                    idx.iter().zip(data.iter()).filter(move |(v, _)| **v as usize >= u).map(move |(&v, w)| {
+                        let dv = dense[v as usize] as u32;
+                        let w: usize = (*w).into();
+                        (du.min(dv), du.max(dv), w as u32)
+                    })
+                })
+                .collect();
+            drop(graph);
+            pairs.par_sort_unstable_by_key(|&(a, b, _)| (a, b));
+            let mut triplets: Vec<(NodeIdx, NodeIdx, usize)> = Vec::new();
+            for &(a, b, w) in &pairs {
+                match triplets.last_mut() {
+                    Some(t) if t.0 == a as usize && t.1 == b as usize => t.2 += w as usize,
+                    _ => triplets.push((a as usize, b as usize, w as usize)),
+                }
+            }
+            drop(pairs);
+            let aggregated_graph = Graph::<usize>::from_undirected_triplets(triplets, k);
+            let new_node_weights: Vec<_> = (0..k).map(|p| partition_weights.get(p)).collect();
+            return Ok(WeightedPartitionedGraph {
+                graph: aggregated_graph,
+                partitions: LeidenNodePartitioning::initialize_from_partitions((0..k).collect()),
+                node_weights: new_node_weights,
+                partition_weights,
+                quality_metrics,
+                ancestor_map: dense,
+                rng: StdRng::seed_from_u64(seed.unwrap_or(0)),
+            });
+        }
         // --- as in `new`
         let partitions = if partitions.is_normalized() {
             partitions

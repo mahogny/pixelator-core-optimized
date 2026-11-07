@@ -49,7 +49,9 @@ fn memlog(tag: &str) {
     }
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         let get = |k: &str| s.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0) / 1e6).unwrap_or(0.0);
-        eprintln!("[mem] {tag:30} rss {:6.2} GB  peak {:6.2} GB", get("VmRSS:"), get("VmHWM:"));
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+        eprintln!("[mem] {tag:30} rss {:6.2} GB  peak {:6.2} GB  t {t:8.1}s", get("VmRSS:"), get("VmHWM:"));
     }
 }
 
@@ -90,7 +92,53 @@ pub fn hybrid_community_detection(
     );
 
     memlog("core: FLP done");
-    let partition = NodePartitioning::into_node_partitioning(node_partition);
+    hybrid_after_flp(graph, quality_function, randomness, seed, max_iteration, node_partition, refine_partitions, multiplet_recovery, true)
+}
+
+/// [pixelator-rs patch] The hybrid pipeline after label propagation: aggregation of the given
+/// FLP partition (e.g. from `fast_label_propagation::parallel::bipartite_label_propagation`) and
+/// Leiden refinement. `hybrid_community_detection` = FLP + this.
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_from_flp_partition(
+    graph: Graph<u8>,
+    quality_function: impl QualityMetrics,
+    randomness: f64,
+    seed: Option<u64>,
+    max_iteration: Option<usize>,
+    node_partition: FastNodePartitioning,
+    refine_partitions: bool,
+    multiplet_recovery: bool,
+) -> (
+    LeidenNodePartitioning,
+    PartitionedGraphStatistics,
+    PartitionedGraphStatistics,
+) {
+    hybrid_after_flp(graph, quality_function, randomness, seed, max_iteration, node_partition, refine_partitions, multiplet_recovery, false)
+}
+
+/// `exact` = reproduce upstream's partition numbering (needs the partition -> nodes hash index of
+/// the FLP partition); otherwise partitions are numbered by rank (no index, less memory/time).
+#[allow(clippy::too_many_arguments)]
+fn hybrid_after_flp(
+    graph: Graph<u8>,
+    quality_function: impl QualityMetrics,
+    randomness: f64,
+    seed: Option<u64>,
+    max_iteration: Option<usize>,
+    node_partition: FastNodePartitioning,
+    refine_partitions: bool,
+    multiplet_recovery: bool,
+    exact: bool,
+) -> (
+    LeidenNodePartitioning,
+    PartitionedGraphStatistics,
+    PartitionedGraphStatistics,
+) {
+    let partition = if exact || refine_partitions {
+        NodePartitioning::into_node_partitioning(node_partition)
+    } else {
+        LeidenNodePartitioning::new_without_index(node_partition.node_partition_map)
+    };
     memlog("core: into leiden partitioning");
 
     // [pixelator-rs patch] aggregate directly from Graph<u8> (no full Graph<usize> copy)
@@ -119,12 +167,15 @@ pub fn hybrid_community_detection(
 
     if multiplet_recovery {
         leiden(&mut wp_graph, randomness, max_iteration, None);
+        memlog("core: leiden done");
     }
     let post_leiden_statistics = wp_graph.get_statistics();
 
-    let final_partitioning = LeidenNodePartitioning::initialize_from_partitions(
-        wp_graph.get_ancestor_to_partition_map(),
-    );
+    // [pixelator-rs patch] callers only read node -> partition: skip the per-node index
+    let final_partitioning = LeidenNodePartitioning::new_without_index(wp_graph.get_ancestor_to_partition_map());
+    memlog("core: final partition");
+    drop(wp_graph);
+    memlog("core: partitioned graph dropped");
     debug!(
         "Completed Leiden. {} partitions found. Final quality: {}.\n Graph Statistics: {:?}",
         final_partitioning.num_partitions(),
