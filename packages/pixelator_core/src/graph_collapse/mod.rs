@@ -57,9 +57,9 @@ where
         // One queue and visited set per Rayon job, reused across its nodes,
         // instead of a fresh pair for every search.
         .map_init(
-            || (VecDeque::new(), HashSet::default()),
+            || (VecDeque::new(), StampSet::new(graph.get_degrees().len())),
             |scratch, node| {
-                find_collapse_target(
+                find_collapse_target_with(
                     graph,
                     umi_mapping,
                     node,
@@ -136,9 +136,24 @@ pub fn find_collapse_target<T>(
 where
     T: EdgeWeight,
 {
+    find_collapse_target_with(graph, umi_mapping, node, bfs_threshold, hamming_threshold, scratch)
+}
+
+/// [`find_collapse_target`] with any [`VisitedSet`] (same result).
+pub fn find_collapse_target_with<T, S>(
+    graph: &Graph<T>,
+    umi_mapping: &UmiToNodeIndexMapping,
+    node: NodeIdx,
+    bfs_threshold: usize,
+    hamming_threshold: u8,
+    scratch: &mut (VecDeque<(NodeIdx, usize)>, S),
+) -> Option<(UMI, usize, usize)>
+where
+    T: EdgeWeight,
+    S: VisitedSet,
+{
     let node_umi = umi_mapping.map_node_index_to_umi(node);
-    graph
-        .bounded_even_breadth_first_search_iter(node, Some(bfs_threshold), scratch)
+    bounded_even_bfs(graph, node, Some(bfs_threshold), scratch)
         .map(|(node_id, depth)| (umi_mapping.map_node_index_to_umi(node_id), depth))
         .find(|&(umi, _)| within_hamming_distance(node_umi as u64, umi as u64, hamming_threshold))
         .map(|(umi, depth)| {
@@ -148,6 +163,56 @@ where
                 hamming_distance_2bit(node_umi as u64, umi as u64) as usize,
             )
         })
+}
+
+/// Visited set of the bounded search. `FxHashSet<NodeIdx>` works for any graph; [`StampSet`] is an
+/// epoch-stamped array over `0..num_nodes` (no hashing, O(1) clear) with identical behaviour.
+pub trait VisitedSet {
+    fn clear(&mut self);
+    fn contains(&self, node: &NodeIdx) -> bool;
+    fn insert(&mut self, node: NodeIdx);
+}
+
+impl VisitedSet for HashSet<NodeIdx> {
+    fn clear(&mut self) {
+        HashSet::clear(self)
+    }
+    fn contains(&self, node: &NodeIdx) -> bool {
+        HashSet::contains(self, node)
+    }
+    fn insert(&mut self, node: NodeIdx) {
+        HashSet::insert(self, node);
+    }
+}
+
+/// Epoch-stamped visited set over node indices `0..n`.
+pub struct StampSet {
+    stamp: Vec<u32>,
+    epoch: u32,
+}
+
+impl StampSet {
+    pub fn new(n: usize) -> Self {
+        Self { stamp: vec![0; n], epoch: 1 }
+    }
+}
+
+impl VisitedSet for StampSet {
+    fn clear(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.fill(0);
+            self.epoch = 1;
+        }
+    }
+    #[inline]
+    fn contains(&self, node: &NodeIdx) -> bool {
+        self.stamp[*node as usize] == self.epoch
+    }
+    #[inline]
+    fn insert(&mut self, node: NodeIdx) {
+        self.stamp[node as usize] = self.epoch;
+    }
 }
 
 pub trait GraphCollapseExt<T: EdgeWeight> {
@@ -171,6 +236,18 @@ impl<T: EdgeWeight> GraphCollapseExt<T> for Graph<T> {
         bound: Option<usize>,
         scratch: &'a mut (VecDeque<(NodeIdx, usize)>, HashSet<NodeIdx>),
     ) -> impl Iterator<Item = (NodeIdx, usize)> + 'a {
+        bounded_even_bfs(self, start_node, bound, scratch)
+    }
+}
+
+/// Generic body of [`GraphCollapseExt::bounded_even_breadth_first_search_iter`].
+fn bounded_even_bfs<'a, T: EdgeWeight, S: VisitedSet>(
+    graph: &'a Graph<T>,
+    start_node: NodeIdx,
+    bound: Option<usize>,
+    scratch: &'a mut (VecDeque<(NodeIdx, usize)>, S),
+) -> impl Iterator<Item = (NodeIdx, usize)> + 'a {
+    {
         let (node_queue, visited) = scratch;
         node_queue.clear();
         visited.clear();
@@ -184,7 +261,7 @@ impl<T: EdgeWeight> GraphCollapseExt<T> for Graph<T> {
                 visited.insert(node);
 
                 if bound.is_none_or(|bound| d < bound) {
-                    for neighbor in self.neighbors_iter(node) {
+                    for neighbor in graph.neighbors_iter(node) {
                         if visited.contains(&neighbor) {
                             continue;
                         }
